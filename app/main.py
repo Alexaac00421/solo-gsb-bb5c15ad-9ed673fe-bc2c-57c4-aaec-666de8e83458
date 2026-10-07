@@ -19,6 +19,7 @@ from .hashing import (
     correction_request_hash,
     record_hash,
     request_hash,
+    vehicle_order_request_hash,
     withdrawal_hash,
     withdrawal_request_hash,
 )
@@ -35,6 +36,8 @@ from .schemas import (
     ExhibitOut,
     HandoverRecordOut,
     RehearsalOut,
+    VehicleOrderIn,
+    VehicleOrderReport,
     WithdrawalOut,
     WithdrawalRequest,
 )
@@ -60,7 +63,8 @@ app = FastAPI(
     version=__version__,
     lifespan=lifespan,
     description="校验借展交接链的首站、人员衔接、时间递增与封签连续性；"
-                "幂等写入，失败批次不落任何交接记录，保留可查询的哈希审计链。",
+                "幂等写入，失败批次不落任何交接记录，保留可查询的哈希审计链；"
+                "支持借展车次多展品整车一次确认（同事务各件入链或整体拒绝）。",
 )
 
 # ---------------------------------------------------------------- 工具
@@ -187,6 +191,79 @@ def _build_report(batch_id: uuid.UUID, exhibit_id: str, result, record_count: in
 
 
 def _replay_report(row: dict) -> dict:
+    report = dict(row["report"])
+    report["idempotent_replay"] = True
+    return report
+
+
+# ---------------------------------------------------------------- 借展车次（整车多展品）
+
+
+def _vehicle_item_payload(item) -> dict:
+    """车次单件载荷的规范化 JSON（与单件接口 request_hash 所用形态一致）。"""
+    return {"exhibit_id": item.exhibit_id, "records": [r.model_dump(mode="json") for r in item.records]}
+
+
+def _vehicle_order_fingerprint(payload: VehicleOrderIn) -> str:
+    """整车载荷指纹：对各件展品编号、顺序与各自记录字段全部敏感。"""
+    return vehicle_order_request_hash([_vehicle_item_payload(item) for item in payload.items])
+
+
+def _build_vehicle_item_report(exhibit_id: str, result, record_count: int,
+                               batch_id: uuid.UUID | None) -> dict:
+    return {
+        "exhibit_id": exhibit_id,
+        "status": "ACCEPTED" if result.accepted else "REJECTED",
+        "record_count": record_count,
+        "first_break": _serialize_first_break(result),
+        "items": _serialize_items(result),
+        "batch_id": str(batch_id) if batch_id is not None else None,
+    }
+
+
+def _build_vehicle_order_report(order_id: uuid.UUID, results: list[tuple[str, object, int]],
+                                batch_ids: list[uuid.UUID], now: datetime,
+                                all_accepted: bool) -> dict:
+    """组装整车报告。results 为 (exhibit_id, validate 结果, 记录数)，与提交顺序一致。
+
+    任一件核验失败即整车 REJECTED：各件结果逐条列出，但不返回任何批次号；
+    全数通过时各件回带同一事务内写入的批次号。
+    """
+    item_reports = [
+        _build_vehicle_item_report(
+            exhibit_id, result, record_count,
+            batch_id if all_accepted else None,
+        )
+        for (exhibit_id, result, record_count), batch_id in zip(results, batch_ids)
+    ]
+    first_break = None
+    vehicle_first_break = None
+    if not all_accepted:
+        for item_report in item_reports:
+            if item_report["first_break"] is not None:
+                fb = item_report["first_break"]
+                # 顶层 first_break 保持单件报告同款形态（seq 为该件提交序内的记录序）
+                first_break = fb
+                vehicle_first_break = {
+                    "exhibit_id": item_report["exhibit_id"],
+                    "seq": fb["seq"],
+                    "rule": fb["rule"],
+                    "message": fb["message"],
+                }
+                break
+    return {
+        "vehicle_order_id": str(order_id),
+        "status": "ACCEPTED" if all_accepted else "REJECTED",
+        "item_count": len(results),
+        "first_break": first_break,
+        "vehicle_first_break": vehicle_first_break,
+        "items": item_reports,
+        "idempotent_replay": False,
+        "created_at": now.isoformat(),
+    }
+
+
+def _replay_vehicle_order(row: dict) -> dict:
     report = dict(row["report"])
     report["idempotent_replay"] = True
     return report
@@ -849,6 +926,232 @@ def get_handover_batch(batch_id: uuid.UUID):
         row = conn.execute("SELECT * FROM batches WHERE batch_id = %s", (batch_id,)).fetchone()
     if not row:
         raise HTTPException(status_code=404, detail=f"批次「{batch_id}」不存在")
+    return row["report"]
+
+
+# ---------------------------------------------------------------- 借展车次（整车确认）
+
+
+@app.post(
+    "/api/v1/vehicle-handover-orders",
+    response_model=VehicleOrderReport,
+    tags=["vehicle-orders"],
+)
+def submit_vehicle_handover_order(
+    payload: VehicleOrderIn,
+    response: Response,
+    idempotency_key: str = Header(min_length=1, max_length=128),
+):
+    """借展车次：同一车次下 2..20 件互不重复展品的交接记录，馆方一次确认整车结果。
+
+    提交内容为同一车次下各件展品编号及各自按时序排列的交接记录（逐件沿用
+    现有规则，以撤回后的有效状态核验），并携带 `Idempotency-Key`。
+
+    - 展品不存在 -> 整单 `404` 报错，不写任何数据；
+    - 请求格式不合法（件数不在 2..20、展品编号重复、记录字段非法等）
+      -> `422`，不写任何数据；
+    - 任一件核验失败 -> 整单 `REJECTED`，保存整车拒绝报告，列出各件逐条
+      结果（含整车首个断点 `vehicle_first_break`），但**不写交接批次和
+      记录、不推进任何展品状态**；
+    - 全数通过 -> 在**同一事务**内为各件写入既有批次（各件一个批次）与
+      原交接哈希链（每件的 `prev_hash` 仍只接本展品的物理链尾），返回
+      车次号及各批次报告；
+    - 并发：按展品编号有序获取各展品行锁，重叠车次之间、车次与单件提交
+      之间互不死锁，且不会出现任何「部分入链」；
+    - 幂等：同键同载荷（含 REJECTED 结果）重放原报告
+      （`idempotent_replay=true`，HTTP 200）；同键异载荷 `409`。
+
+    原单件 `/handover-batches` 接口、补正、撤回及审计行为保持兼容
+    （整车写入的各件批次同样可被单件查询、补正、撤回与三链审计覆盖）。
+    """
+    req_hash = _vehicle_order_fingerprint(payload)
+    item_count = len(payload.items)
+
+    try:
+        with get_conn() as conn:
+            # 1) 幂等预检：同键成功/拒绝重试一律先返回首次报告（不做任何业务校验）
+            existing = conn.execute(
+                "SELECT * FROM vehicle_orders WHERE idempotency_key = %s",
+                (idempotency_key,),
+            ).fetchone()
+            if existing:
+                if existing["request_hash"] != req_hash:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="同一 Idempotency-Key 提交了不同的整车请求载荷",
+                    )
+                response.status_code = 200
+                return _replay_vehicle_order(existing)
+
+            # 2) 按展品编号有序锁定整车涉及的全部展品行：
+            #    重叠车次之间、车次与单件/补正/撤回之间都以同样的行级锁
+            #    串行化，避免死锁；后续核验与写入全部在同一事务完成，
+            #    任一件失败即整体回滚，杜绝部分入链。
+            ordered = sorted(payload.items, key=lambda it: it.exhibit_id)
+            exhibits: dict[str, dict] = {}
+            for item in ordered:
+                exhibit = conn.execute(
+                    "SELECT * FROM exhibits WHERE exhibit_id = %s FOR UPDATE",
+                    (item.exhibit_id,),
+                ).fetchone()
+                if not exhibit:
+                    # 展品不存在：整单 404，事务回滚，不产生任何报告/批次/记录
+                    raise HTTPException(
+                        status_code=404,
+                        detail=f"整车提交包含不存在的展品「{item.exhibit_id}」，整单不予受理",
+                    )
+                exhibits[item.exhibit_id] = exhibit
+
+            # 2b) 行锁内再查一次幂等：串行化同键并发的整车提交
+            existing = conn.execute(
+                "SELECT * FROM vehicle_orders WHERE idempotency_key = %s",
+                (idempotency_key,),
+            ).fetchone()
+            if existing:
+                if existing["request_hash"] != req_hash:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="同一 Idempotency-Key 提交了不同的整车请求载荷",
+                    )
+                response.status_code = 200
+                return _replay_vehicle_order(existing)
+
+            # 3) 逐件核验（沿用现有规则引擎；撤回后以有效状态为参照）
+            now = datetime.now(timezone.utc)
+            order_id = uuid.uuid4()
+            batch_ids = [uuid.uuid4() for _ in payload.items]
+            results: list[tuple[str, object, int]] = []
+            for item in payload.items:
+                exhibit = exhibits[item.exhibit_id]
+                withdrawn = _withdrawn_batch_ids(conn, item.exhibit_id)
+                effective = _effective_state(conn, exhibit, withdrawn)
+                result = validate_batch(
+                    _exhibit_state(exhibit, effective), item.records
+                )
+                results.append((item.exhibit_id, result, len(item.records)))
+
+            all_accepted = all(result.accepted for _, result, _ in results)
+
+            # 4) 先落整车单（REJECTED 也保留完整拒绝报告，供重放与审计追溯）
+            report = _build_vehicle_order_report(
+                order_id, results, batch_ids, now, all_accepted
+            )
+            conn.execute(
+                """
+                INSERT INTO vehicle_orders
+                    (vehicle_order_id, idempotency_key, request_hash, status,
+                     item_count, report, created_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """,
+                (order_id, idempotency_key, req_hash, report["status"],
+                 item_count, Jsonb(report), now),
+            )
+
+            # 5) 仅全数通过时：同一事务为各件写既有批次与原交接哈希链，
+            #    并推进各件展品状态；任一步失败整个事务回滚（含整车单）。
+            if all_accepted:
+                for item, batch_id, (_, result, _) in zip(payload.items, batch_ids, results):
+                    exhibit = exhibits[item.exhibit_id]
+                    withdrawn = _withdrawn_batch_ids(conn, item.exhibit_id)
+                    effective = _effective_state(conn, exhibit, withdrawn)
+                    batch_report = _build_report(
+                        batch_id, item.exhibit_id, result,
+                        len(item.records), now,
+                    )
+                    conn.execute(
+                        """
+                        INSERT INTO batches
+                            (batch_id, idempotency_key, exhibit_id, request_hash,
+                             status, report, created_at, vehicle_order_id)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                        """,
+                        (batch_id, f"vehicle:{order_id}:{item.exhibit_id}",
+                         item.exhibit_id, req_hash, batch_report["status"],
+                         Jsonb(batch_report), now, order_id),
+                    )
+
+                    # 该件记录线性追加在其物理链尾：prev_hash 接本展品上一环
+                    # （可能是已撤回历史环），业务参照系使用撤回后有效状态。
+                    prev_hash = exhibit["chain_head_hash"]
+                    prev_seal = effective["current_seal"]
+                    chain_seq = exhibit["chain_length"]
+                    for seq_in_batch, rec in enumerate(item.records, start=1):
+                        chain_seq += 1
+                        h = record_hash(
+                            prev_hash=prev_hash,
+                            exhibit_id=item.exhibit_id,
+                            chain_seq=chain_seq,
+                            batch_id=batch_id,
+                            location=rec.location,
+                            from_person=rec.from_person,
+                            to_person=rec.to_person,
+                            seal_no=rec.seal_no,
+                            seal_change_reason=rec.seal_change_reason,
+                            occurred_at=rec.occurred_at,
+                            voucher_digest=rec.voucher_digest,
+                        )
+                        conn.execute(
+                            """
+                            INSERT INTO handover_records
+                                (batch_id, exhibit_id, chain_seq, seq_in_batch, location,
+                                 from_person, to_person, seal_no, seal_changed,
+                                 seal_change_reason, occurred_at, voucher_digest,
+                                 prev_hash, record_hash)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            """,
+                            (batch_id, item.exhibit_id, chain_seq, seq_in_batch,
+                             rec.location, rec.from_person, rec.to_person, rec.seal_no,
+                             rec.seal_no != prev_seal, rec.seal_change_reason,
+                             rec.occurred_at, rec.voucher_digest, prev_hash, h),
+                        )
+                        prev_hash = h
+                        prev_seal = rec.seal_no
+
+                    last = item.records[-1]
+                    conn.execute(
+                        """
+                        UPDATE exhibits
+                           SET custodian = %s, current_seal = %s, last_time = %s,
+                               chain_length = %s, chain_head_hash = %s
+                         WHERE exhibit_id = %s
+                        """,
+                        (last.to_person, last.seal_no, last.occurred_at,
+                         chain_seq, prev_hash, item.exhibit_id),
+                    )
+
+            return report
+    except UniqueViolation:
+        # 并发下同键插入整车单：回滚后按已存在整车单返回（等价于后到重试）
+        with get_conn() as conn:
+            existing = conn.execute(
+                "SELECT * FROM vehicle_orders WHERE idempotency_key = %s",
+                (idempotency_key,),
+            ).fetchone()
+        if existing and existing["request_hash"] == req_hash:
+            response.status_code = 200
+            return _replay_vehicle_order(existing)
+        raise HTTPException(
+            status_code=409,
+            detail="同一 Idempotency-Key 提交了不同的整车请求载荷",
+        )
+
+
+@app.get(
+    "/api/v1/vehicle-handover-orders/{vehicle_order_id}",
+    response_model=VehicleOrderReport,
+    tags=["vehicle-orders"],
+)
+def get_vehicle_handover_order(vehicle_order_id: uuid.UUID):
+    """按车次号查询整车确认报告（含各件逐条结果与各批次号）。"""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM vehicle_orders WHERE vehicle_order_id = %s",
+            (vehicle_order_id,),
+        ).fetchone()
+    if not row:
+        raise HTTPException(
+            status_code=404, detail=f"车次「{vehicle_order_id}」不存在"
+        )
     return row["report"]
 
 
@@ -1517,7 +1820,7 @@ def list_batches(
 ):
     """查询展品的批次历史（含被驳回与已撤回批次，供审计追溯）。"""
     sql = """
-        SELECT batch_id, status, report, created_at
+        SELECT batch_id, status, report, created_at, vehicle_order_id
           FROM batches
          WHERE exhibit_id = %s
     """
@@ -1543,6 +1846,7 @@ def list_batches(
             "withdrawn": r["batch_id"] in wd_by_batch,
             "withdrawal": _withdrawal_ref(wd_by_batch[r["batch_id"]])
             if r["batch_id"] in wd_by_batch else None,
+            "vehicle_order_id": str(r["vehicle_order_id"]) if r["vehicle_order_id"] else None,
         }
         for r in rows
     ]

@@ -33,6 +33,34 @@ class BatchRequest(BaseModel):
     records: list[HandoverIn] = Field(min_length=1, max_length=1000, description="按时间排列的交接记录")
 
 
+# ---------------------------------------------------------------- 借展车次（整车多展品）
+
+
+class VehicleItemIn(BaseModel):
+    """车次内单件展品的交接提交（展品编号 + 该件按时序排列的交接记录）。"""
+
+    exhibit_id: str = Field(min_length=1, max_length=64, description="展品编号")
+    records: list[HandoverIn] = Field(min_length=1, max_length=1000, description="该件按时间排列的交接记录")
+
+
+class VehicleOrderIn(BaseModel):
+    """借展车次整车提交：同一车次下 2..20 件互不重复的展品，馆方一次确认整车结果。"""
+
+    items: list[VehicleItemIn] = Field(
+        min_length=2, max_length=20,
+        description="同一车次下各件展品的交接提交（2..20 件，展品编号互不重复）",
+    )
+
+    @field_validator("items")
+    @classmethod
+    def _exhibit_ids_unique(cls, v: list["VehicleItemIn"]) -> list["VehicleItemIn"]:
+        ids = [item.exhibit_id for item in v]
+        if len(set(ids)) != len(ids):
+            dupes = sorted({x for x in ids if ids.count(x) > 1})
+            raise ValueError(f"同一车次下展品编号不得重复，重复项：{', '.join(dupes)}")
+        return v
+
+
 # ---------------------------------------------------------------- 凭证摘要补正
 
 
@@ -72,6 +100,15 @@ class FirstBreakOut(BaseModel):
     message: str
 
 
+class VehicleFirstBreakOut(BaseModel):
+    """整车首个断点：定位到具体展品及该件提交序内的记录。"""
+
+    exhibit_id: str
+    seq: int
+    rule: str
+    message: str
+
+
 class BatchReport(BaseModel):
     """核验报告（POST 提交与 GET 查询共用）。"""
 
@@ -81,6 +118,42 @@ class BatchReport(BaseModel):
     record_count: int
     first_break: Optional[FirstBreakOut]
     items: list[ItemOut]
+    idempotent_replay: bool
+    created_at: datetime
+
+
+class VehicleItemReport(BaseModel):
+    """整车报告中单件展品的逐件结果（沿用既有批次报告字段与逐条原因）。"""
+
+    exhibit_id: str
+    status: Literal["ACCEPTED", "REJECTED"]
+    record_count: int
+    first_break: Optional[FirstBreakOut]
+    items: list[ItemOut]
+    # 全数通过时该件写入的既有批次号（整车同事务各件一批）；整车被拒时无批次
+    batch_id: Optional[str] = None
+
+
+class VehicleOrderReport(BaseModel):
+    """借展车次整车确认结果（POST 提交与 GET 查询共用）。
+
+    - 任一件核验失败：整单 REJECTED，列出各件逐条结果，
+      但不写任何交接批次与交接记录、不推进任何展品状态；
+    - 全数通过：同一事务内为各件写入既有批次与原交接哈希链，
+      返回车次号及各批次报告。
+    """
+
+    vehicle_order_id: str = Field(description="车次号（服务端生成的整车单号 UUID）")
+    status: Literal["ACCEPTED", "REJECTED"]
+    item_count: int
+    first_break: Optional[FirstBreakOut] = Field(
+        default=None, description="整车首个断点：提交顺序中第一件不合格记录的首个原因",
+    )
+    vehicle_first_break: Optional[VehicleFirstBreakOut] = Field(
+        default=None,
+        description="首个断点定位（exhibit_id + 该件内 seq + 规则码）；整车通过时为 null",
+    )
+    items: list[VehicleItemReport]
     idempotent_replay: bool
     created_at: datetime
 
@@ -252,6 +325,8 @@ class BatchSummary(BaseModel):
     # 撤回引入：批次是否已被撤回及其撤回引用（新增字段，向后兼容）
     withdrawn: bool = False
     withdrawal: Optional[WithdrawalRefOut] = None
+    # 借展车次引入：由整车提交写入的批次回带车次号（单件接口批次为 null）
+    vehicle_order_id: Optional[str] = None
 
 
 class HandoverTokenOut(BaseModel):

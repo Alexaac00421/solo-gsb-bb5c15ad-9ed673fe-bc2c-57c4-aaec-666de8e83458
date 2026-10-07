@@ -31,7 +31,10 @@ CREATE TABLE IF NOT EXISTS batches (
     request_hash    TEXT        NOT NULL,               -- 请求体指纹（同键不同载荷 -> 409）
     status          TEXT        NOT NULL CHECK (status IN ('ACCEPTED', 'REJECTED')),
     report          JSONB       NOT NULL,               -- 完整核验报告（含逐项原因）
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- 借展车次：由整车提交（/vehicle-handover-orders）写入的批次回指车次号；
+    -- 单件接口批次为 NULL。整车单与各件批次在同一事务提交。
+    vehicle_order_id UUID
 );
 -- 幂等约束：同一幂等键全局唯一
 CREATE UNIQUE INDEX IF NOT EXISTS uq_batches_idempotency_key ON batches (idempotency_key);
@@ -110,6 +113,39 @@ CREATE TABLE IF NOT EXISTS batch_withdrawals (
 );
 CREATE INDEX IF NOT EXISTS idx_wd_exhibit_seq ON batch_withdrawals (exhibit_id, withdrawal_seq);
 CREATE UNIQUE INDEX IF NOT EXISTS uq_wd_batch ON batch_withdrawals (batch_id);
+
+-- 借展车次整车确认：同一车次下 2..20 件互不重复展品一次确认。
+-- 整车单只在本表单落一行：
+-- - 任一件核验失败：status=REJECTED，报告列出各件逐条结果，
+--   不写任何 batches/handover_records，不推进任何展品状态；
+-- - 全数通过：同一事务内为各件写既有 batches（回指 vehicle_order_id）
+--   与原交接哈希链，展品行锁按展品编号有序获取，杜绝并发部分入链。
+-- 幂等：idempotency_key 全局唯一 + request_hash 整车载荷指纹；
+-- 同键同载荷（含 REJECTED 结果）重放原报告，同键异载荷 409。
+CREATE TABLE IF NOT EXISTS vehicle_orders (
+    vehicle_order_id  UUID        PRIMARY KEY,
+    idempotency_key   TEXT        NOT NULL,             -- 调用方幂等键（全局唯一）
+    request_hash      TEXT        NOT NULL,             -- 整车请求体指纹（同键不同载荷 -> 409）
+    status            TEXT        NOT NULL CHECK (status IN ('ACCEPTED', 'REJECTED')),
+    item_count        INT         NOT NULL,
+    report            JSONB       NOT NULL,             -- 整车完整报告（含各件逐条结果；重放原样返回）
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_vehicle_idempotency_key ON vehicle_orders (idempotency_key);
+CREATE INDEX IF NOT EXISTS idx_vehicle_created ON vehicle_orders (created_at, vehicle_order_id);
+-- 分批建表顺序兼容：batches 已先建，此处幂等补列并加外键
+ALTER TABLE batches ADD COLUMN IF NOT EXISTS vehicle_order_id UUID;
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'fk_batches_vehicle_order'
+    ) THEN
+        ALTER TABLE batches
+            ADD CONSTRAINT fk_batches_vehicle_order
+            FOREIGN KEY (vehicle_order_id) REFERENCES vehicle_orders (vehicle_order_id);
+    END IF;
+END$$;
+CREATE INDEX IF NOT EXISTS idx_batches_vehicle ON batches (vehicle_order_id);
 
 -- 种子数据：两件已登记展品，便于开箱即测
 INSERT INTO exhibits (exhibit_id, name, home_location, custodian, current_seal,

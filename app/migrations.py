@@ -8,6 +8,7 @@
 - v1.1：补正链（digest_corrections 表与 exhibits.correction_* 列）
 - v1.3：批次撤回链（batch_withdrawals 表、exhibits.withdrawal_* 列，
         以及撤回后回退状态所需的 registered_custodian/registered_initial_seal 列）
+- v1.4：借展车次整车确认（vehicle_orders 表，batches.vehicle_order_id 回指列）
 """
 from __future__ import annotations
 
@@ -110,6 +111,35 @@ _STATEMENTS = (
            SELECT 1 FROM batch_withdrawals w WHERE w.exhibit_id = e.exhibit_id
        )
     """,
+    # ---------------------------------------------------------------- 借展车次
+    """
+    CREATE TABLE IF NOT EXISTS vehicle_orders (
+        vehicle_order_id  UUID        PRIMARY KEY,
+        idempotency_key   TEXT        NOT NULL,
+        request_hash      TEXT        NOT NULL,
+        status            TEXT        NOT NULL CHECK (status IN ('ACCEPTED', 'REJECTED')),
+        item_count        INT         NOT NULL,
+        report            JSONB       NOT NULL,
+        created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+    """,
+    "CREATE UNIQUE INDEX IF NOT EXISTS uq_vehicle_idempotency_key ON vehicle_orders (idempotency_key)",
+    "CREATE INDEX IF NOT EXISTS idx_vehicle_created ON vehicle_orders (created_at, vehicle_order_id)",
+    "ALTER TABLE batches ADD COLUMN IF NOT EXISTS vehicle_order_id UUID",
+    # 外键需幂等添加：Postgres 的 ADD CONSTRAINT 无 IF NOT EXISTS，用 DO 块判存
+    """
+    DO $$
+    BEGIN
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_constraint WHERE conname = 'fk_batches_vehicle_order'
+        ) THEN
+            ALTER TABLE batches
+                ADD CONSTRAINT fk_batches_vehicle_order
+                FOREIGN KEY (vehicle_order_id) REFERENCES vehicle_orders (vehicle_order_id);
+        END IF;
+    END$$;
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_batches_vehicle ON batches (vehicle_order_id)",
 )
 
 

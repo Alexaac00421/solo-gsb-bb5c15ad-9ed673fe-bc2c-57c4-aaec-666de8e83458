@@ -79,6 +79,17 @@ def record_hash(
     return sha256_hex(canonical_json(payload))
 
 
+def vehicle_order_request_hash(items: list[dict]) -> str:
+    """借展车次（多展品整车提交）请求体指纹：用于幂等键下检测「同键不同载荷」。
+
+    整车单的载荷是同一车次下 2..20 件展品各自（展品编号 + 按时序排列的
+    交接记录）的列表；指纹对提交顺序与各字段全部敏感——任一件的编号或
+    任一记录字段变化、展品集合/顺序变化，指纹都不同。
+    """
+    payload = {"kind": "vehicle_handover_order", "items": items}
+    return sha256_hex(canonical_json(payload))
+
+
 def correction_request_hash(
     exhibit_id: str,
     target_chain_seq: int,

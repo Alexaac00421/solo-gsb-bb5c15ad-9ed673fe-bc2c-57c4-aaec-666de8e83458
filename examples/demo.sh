@@ -326,3 +326,101 @@ curl -s "${BASE}/api/v1/exhibits/${EXHIBIT_ID}/audit/verify" | pp
 echo; echo "== 31) 批次历史：已撤回批次带 withdrawn 标记与撤回引用 =="
 curl -s "${BASE}/api/v1/exhibits/${EXHIBIT_ID}/batches" | pp
 
+# ---------------------------------------------------------------- 借展车次
+# 整车确认使用两件全新登记展品，避免与上面单件流程的展品状态互相影响。
+VH_A="EX-VHA-$(date +%s)"
+VH_B="EX-VHB-$(date +%s)"
+KEY_VH="demo-vehicle-${VH_A}"
+
+echo; echo "== 32) 借展车次：登记两件展品（同车交接）=="
+curl -s -X POST "${BASE}/api/v1/exhibits" \
+  -H 'Content-Type: application/json' \
+  -d "{\"exhibit_id\":\"${VH_A}\",\"name\":\"车次展品甲\",\"home_location\":\"南京博物院库房B区\",\"custodian\":\"张伟\",\"initial_seal\":\"SEAL-NJ-0001\"}" | pp
+curl -s -X POST "${BASE}/api/v1/exhibits" \
+  -H 'Content-Type: application/json' \
+  -d "{\"exhibit_id\":\"${VH_B}\",\"name\":\"车次展品乙\",\"home_location\":\"苏州博物院库房\",\"custodian\":\"周琳\",\"initial_seal\":\"SEAL-SZ-0001\"}" | pp
+
+echo; echo "== 33) 整车提交（2 件互不重复展品，各 1 条首站记录；同一事务入链）=="
+VEHICLE_RESP="$(curl -s -X POST "${BASE}/api/v1/vehicle-handover-orders" \
+  -H 'Content-Type: application/json' \
+  -H "Idempotency-Key: ${KEY_VH}" \
+  -d @- <<JSON
+{
+  "items": [
+    {"exhibit_id": "${VH_A}", "records": [
+      {"location":"南京博物院库房B区","from_person":"张伟","to_person":"李静",
+       "seal_no":"SEAL-NJ-0001","occurred_at":"2026-10-10T09:00:00+08:00",
+       "voucher_digest":"sha256:9f2c4a1b7e3d5f608192a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f9"}
+    ]},
+    {"exhibit_id": "${VH_B}", "records": [
+      {"location":"苏州博物院库房","from_person":"周琳","to_person":"陈晨",
+       "seal_no":"SEAL-SZ-0001","occurred_at":"2026-10-10T09:20:00+08:00",
+       "voucher_digest":"sha256:aa11bb22cc33dd44ee55ff660011223344556677889900aabbccddeeff00112233"}
+    ]}
+  ]
+}
+JSON
+)"
+echo "${VEHICLE_RESP}" | pp
+VEHICLE_ID="$(echo "${VEHICLE_RESP}" | json_field vehicle_order_id)"
+echo "车次号：${VEHICLE_ID}"
+[ -n "${VEHICLE_ID}" ] || { echo "未取到车次号，终止"; exit 1; }
+
+echo; echo "== 34) 同键同载荷重放：返回原整车报告（200, idempotent_replay=true，含各批次号）=="
+curl -s -D /tmp/vh34.hdr -X POST "${BASE}/api/v1/vehicle-handover-orders" \
+  -H 'Content-Type: application/json' \
+  -H "Idempotency-Key: ${KEY_VH}" \
+  -d "{\"items\":[{\"exhibit_id\":\"${VH_A}\",\"records\":[{\"location\":\"南京博物院库房B区\",\"from_person\":\"张伟\",\"to_person\":\"李静\",\"seal_no\":\"SEAL-NJ-0001\",\"occurred_at\":\"2026-10-10T09:00:00+08:00\",\"voucher_digest\":\"sha256:9f2c4a1b7e3d5f608192a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f9\"}]},{\"exhibit_id\":\"${VH_B}\",\"records\":[{\"location\":\"苏州博物院库房\",\"from_person\":\"周琳\",\"to_person\":\"陈晨\",\"seal_no\":\"SEAL-SZ-0001\",\"occurred_at\":\"2026-10-10T09:20:00+08:00\",\"voucher_digest\":\"sha256:aa11bb22cc33dd44ee55ff660011223344556677889900aabbccddeeff00112233\"}]}]}" | pp
+grep -i '^HTTP/' /tmp/vh34.hdr
+
+echo; echo "== 35) GET 车次报告；各件批次历史回带 vehicle_order_id =="
+curl -s "${BASE}/api/v1/vehicle-handover-orders/${VEHICLE_ID}" | pp
+curl -s "${BASE}/api/v1/exhibits/${VH_A}/batches" | pp
+curl -s "${BASE}/api/v1/exhibits/${VH_B}/batches" | pp
+
+echo; echo "== 36) 任一件违规 -> 整车 REJECTED：各件逐条结果，但不写批次/记录、不推进状态 =="
+curl -s -X POST "${BASE}/api/v1/vehicle-handover-orders" \
+  -H 'Content-Type: application/json' \
+  -H "Idempotency-Key: demo-vehicle-bad-${VH_A}" \
+  -d @- <<JSON | pp
+{
+  "items": [
+    {"exhibit_id": "${VH_A}", "records": [
+      {"location":"上海交接区","from_person":"李静","to_person":"王强",
+       "seal_no":"SEAL-NJ-0001","occurred_at":"2026-10-11T09:00:00+08:00",
+       "voucher_digest":"sha256:5566778899aabbccddeeff00112233445566778899aabbccddeeff0011223344"}
+    ]},
+    {"exhibit_id": "${VH_B}", "records": [
+      {"location":"西安交接区","from_person":"陌生人","to_person":"赵磊",
+       "seal_no":"SEAL-XA-9001","occurred_at":"2026-10-11T08:00:00+08:00",
+       "voucher_digest":"not-a-valid-digest"}
+    ]}
+  ]
+}
+JSON
+echo "--- 两件展品链长仍各为 1（拒绝单零写入）---"
+curl -s "${BASE}/api/v1/exhibits/${VH_A}" | pp
+curl -s "${BASE}/api/v1/exhibits/${VH_B}" | pp
+
+echo; echo "== 37) 整车格式/前置拒绝：展品不存在(404) / 件数不足或重复(422) / 同键异载荷(409) =="
+curl -s -o /dev/null -w '含不存在展品                 -> HTTP %{http_code}\n' -X POST \
+  "${BASE}/api/v1/vehicle-handover-orders" \
+  -H 'Content-Type: application/json' -H "Idempotency-Key: demo-vh-miss-${VH_A}" \
+  -d "{\"items\":[{\"exhibit_id\":\"${VH_A}\",\"records\":[{\"location\":\"南京博物院库房B区\",\"from_person\":\"李静\",\"to_person\":\"王强\",\"seal_no\":\"SEAL-NJ-0001\",\"occurred_at\":\"2026-10-12T09:00:00+08:00\",\"voucher_digest\":\"sha256:5566778899aabbccddeeff00112233445566778899aabbccddeeff0011223344\"}]},{\"exhibit_id\":\"EX-NOT-EXIST\",\"records\":[{\"location\":\"x\",\"from_person\":\"a\",\"to_person\":\"b\",\"seal_no\":\"S\",\"occurred_at\":\"2026-10-12T09:00:00+08:00\",\"voucher_digest\":\"sha256:aa11bb22cc33dd44ee55ff660011223344556677889900aabbccddeeff00112233\"}]}]}"
+curl -s -o /dev/null -w '仅 1 件（须 2..20）          -> HTTP %{http_code}\n' -X POST \
+  "${BASE}/api/v1/vehicle-handover-orders" \
+  -H 'Content-Type: application/json' -H "Idempotency-Key: demo-vh-one-${VH_A}" \
+  -d "{\"items\":[{\"exhibit_id\":\"${VH_A}\",\"records\":[{\"location\":\"南京博物院库房B区\",\"from_person\":\"李静\",\"to_person\":\"王强\",\"seal_no\":\"SEAL-NJ-0001\",\"occurred_at\":\"2026-10-12T09:00:00+08:00\",\"voucher_digest\":\"sha256:5566778899aabbccddeeff00112233445566778899aabbccddeeff0011223344\"}]}]}"
+curl -s -o /dev/null -w '展品编号重复                 -> HTTP %{http_code}\n' -X POST \
+  "${BASE}/api/v1/vehicle-handover-orders" \
+  -H 'Content-Type: application/json' -H "Idempotency-Key: demo-vh-dup-${VH_A}" \
+  -d "{\"items\":[{\"exhibit_id\":\"${VH_A}\",\"records\":[{\"location\":\"南京博物院库房B区\",\"from_person\":\"李静\",\"to_person\":\"王强\",\"seal_no\":\"SEAL-NJ-0001\",\"occurred_at\":\"2026-10-12T09:00:00+08:00\",\"voucher_digest\":\"sha256:5566778899aabbccddeeff00112233445566778899aabbccddeeff0011223344\"}]},{\"exhibit_id\":\"${VH_A}\",\"records\":[{\"location\":\"南京博物院库房B区\",\"from_person\":\"李静\",\"to_person\":\"赵磊\",\"seal_no\":\"SEAL-NJ-0001\",\"occurred_at\":\"2026-10-12T10:00:00+08:00\",\"voucher_digest\":\"sha256:aa11bb22cc33dd44ee55ff660011223344556677889900aabbccddeeff00112233\"}]}]}"
+curl -s -o /dev/null -w '同键异载荷                   -> HTTP %{http_code}\n' -X POST \
+  "${BASE}/api/v1/vehicle-handover-orders" \
+  -H 'Content-Type: application/json' -H "Idempotency-Key: ${KEY_VH}" \
+  -d "{\"items\":[{\"exhibit_id\":\"${VH_A}\",\"records\":[{\"location\":\"南京博物院库房B区\",\"from_person\":\"张伟\",\"to_person\":\"李静\",\"seal_no\":\"SEAL-NJ-0001\",\"occurred_at\":\"2026-10-10T09:00:00+08:00\",\"voucher_digest\":\"sha256:9f2c4a1b7e3d5f608192a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f0\"}]},{\"exhibit_id\":\"${VH_B}\",\"records\":[{\"location\":\"苏州博物院库房\",\"from_person\":\"周琳\",\"to_person\":\"陈晨\",\"seal_no\":\"SEAL-SZ-0001\",\"occurred_at\":\"2026-10-10T09:20:00+08:00\",\"voucher_digest\":\"sha256:aa11bb22cc33dd44ee55ff660011223344556677889900aabbccddeeff00112233\"}]}]}"
+
+echo; echo "== 38) 整车写入批次与既有接口兼容：两件展品审计均通过 =="
+curl -s "${BASE}/api/v1/exhibits/${VH_A}/audit/verify" | pp
+curl -s "${BASE}/api/v1/exhibits/${VH_B}/audit/verify" | pp
+
