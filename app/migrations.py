@@ -8,6 +8,7 @@
 - v1.1：补正链（digest_corrections 表与 exhibits.correction_* 列）
 - v1.3：批次撤回链（batch_withdrawals 表、exhibits.withdrawal_* 列，
         以及撤回后回退状态所需的 registered_custodian/registered_initial_seal 列）
+- v1.4：车次整车交接单（vehicle_handovers 表）
 """
 from __future__ import annotations
 
@@ -110,6 +111,20 @@ _STATEMENTS = (
            SELECT 1 FROM batch_withdrawals w WHERE w.exhibit_id = e.exhibit_id
        )
     """,
+    # ---------------------------------------------------------------- 车次整车交接单
+    """
+    CREATE TABLE IF NOT EXISTS vehicle_handovers (
+        vehicle_order_id UUID        PRIMARY KEY,
+        idempotency_key  TEXT        NOT NULL,
+        vehicle_id       TEXT        NOT NULL,
+        request_hash     TEXT        NOT NULL,
+        status           TEXT        NOT NULL CHECK (status IN ('ACCEPTED', 'REJECTED')),
+        report           JSONB       NOT NULL,
+        created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+        UNIQUE (idempotency_key)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_vehicle_handovers_vehicle ON vehicle_handovers (vehicle_id, created_at)",
 )
 
 

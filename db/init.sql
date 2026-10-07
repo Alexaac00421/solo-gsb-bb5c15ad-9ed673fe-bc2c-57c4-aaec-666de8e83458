@@ -111,6 +111,24 @@ CREATE TABLE IF NOT EXISTS batch_withdrawals (
 CREATE INDEX IF NOT EXISTS idx_wd_exhibit_seq ON batch_withdrawals (exhibit_id, withdrawal_seq);
 CREATE UNIQUE INDEX IF NOT EXISTS uq_wd_batch ON batch_withdrawals (batch_id);
 
+-- 车次整车交接单：同一车次下 2 至 20 件互不重复展品的一次性整单确认。
+-- 全数通过时在同一事务中为各件写入既有批次（batches）与原交接哈希链
+-- （handover_records），本表只保存整单报告（含各件批次报告）；
+-- 任一件核验失败时仅落本表 REJECTED 整单报告（列出各件逐条结果），
+-- 不写交接批次和记录、不推进任何展品状态；展品不存在或请求格式不合法时
+-- 整单报错，本表也不留痕。
+CREATE TABLE IF NOT EXISTS vehicle_handovers (
+    vehicle_order_id UUID        PRIMARY KEY,
+    idempotency_key  TEXT        NOT NULL,            -- 调用方幂等键（全局唯一）
+    vehicle_id       TEXT        NOT NULL,            -- 车次号
+    request_hash     TEXT        NOT NULL,            -- 请求体指纹（同键不同载荷 -> 409）
+    status           TEXT        NOT NULL CHECK (status IN ('ACCEPTED', 'REJECTED')),
+    report           JSONB       NOT NULL,            -- 整单报告（含各件逐条结果/批次报告）
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (idempotency_key)
+);
+CREATE INDEX IF NOT EXISTS idx_vehicle_handovers_vehicle ON vehicle_handovers (vehicle_id, created_at);
+
 -- 种子数据：两件已登记展品，便于开箱即测
 INSERT INTO exhibits (exhibit_id, name, home_location, custodian, current_seal,
                       registered_custodian, registered_initial_seal)

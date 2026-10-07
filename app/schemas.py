@@ -33,6 +33,33 @@ class BatchRequest(BaseModel):
     records: list[HandoverIn] = Field(min_length=1, max_length=1000, description="按时间排列的交接记录")
 
 
+# ---------------------------------------------------------------- 车次整车交接
+
+
+class VehicleItemIn(BaseModel):
+    """车次整车交接单中一件展品的交接内容（记录按时间排列）。"""
+
+    exhibit_id: str = Field(min_length=1, max_length=64, description="展品编号")
+    records: list[HandoverIn] = Field(min_length=1, max_length=1000, description="该展品按时间排列的交接记录")
+
+
+class VehicleHandoverRequest(BaseModel):
+    """车次整车交接单：同一车次下 2 至 20 件互不重复的展品一次确认整车结果。"""
+
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    vehicle_id: str = Field(min_length=1, max_length=64, description="车次号")
+    items: list[VehicleItemIn] = Field(min_length=2, max_length=20, description="2 至 20 件互不重复的展品")
+
+    @field_validator("items")
+    @classmethod
+    def _unique_exhibits(cls, items: list[VehicleItemIn]) -> list[VehicleItemIn]:
+        ids = [item.exhibit_id for item in items]
+        if len(set(ids)) != len(ids):
+            raise ValueError("同一车次内展品编号不得重复")
+        return items
+
+
 # ---------------------------------------------------------------- 凭证摘要补正
 
 
@@ -81,6 +108,33 @@ class BatchReport(BaseModel):
     record_count: int
     first_break: Optional[FirstBreakOut]
     items: list[ItemOut]
+    idempotent_replay: bool
+    created_at: datetime
+
+
+class VehicleItemReport(BaseModel):
+    """整车交接单中一件展品的逐件结果。
+
+    整单 ACCEPTED 时 batch_id 为该展品写入的既有批次号（可经单件接口查询）；
+    整单 REJECTED 时不写任何批次，batch_id 为 null。
+    """
+
+    exhibit_id: str
+    batch_id: Optional[str]
+    status: Literal["ACCEPTED", "REJECTED"]
+    record_count: int
+    first_break: Optional[FirstBreakOut]
+    items: list[ItemOut]
+
+
+class VehicleHandoverReport(BaseModel):
+    """车次整车交接核验报告（整单一次确认；POST 提交与 GET 查询共用）。"""
+
+    vehicle_order_id: str
+    vehicle_id: str
+    status: Literal["ACCEPTED", "REJECTED"]
+    item_count: int
+    items: list[VehicleItemReport]
     idempotent_replay: bool
     created_at: datetime
 

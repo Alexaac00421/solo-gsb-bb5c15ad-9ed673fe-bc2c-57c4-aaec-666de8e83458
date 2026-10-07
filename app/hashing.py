@@ -45,6 +45,16 @@ def request_hash(exhibit_id: str, records: list[dict], handover_token: str | Non
     return sha256_hex(canonical_json(payload))
 
 
+def vehicle_request_hash(vehicle_id: str, items: list[dict]) -> str:
+    """车次整车交接单请求体指纹：用于幂等键下检测「同键不同载荷」。
+
+    items 为 [{"exhibit_id": ..., "records": [...]}]（按提交顺序），
+    任一件的展品编号或交接记录不同都视为不同载荷（409）。
+    """
+    payload = {"vehicle_id": vehicle_id, "items": items}
+    return sha256_hex(canonical_json(payload))
+
+
 def record_hash(
     *,
     prev_hash: str,

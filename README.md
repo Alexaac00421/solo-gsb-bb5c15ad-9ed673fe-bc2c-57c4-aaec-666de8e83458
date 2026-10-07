@@ -1,6 +1,6 @@
 # 文物借展封签交接核验服务
 
-Python (FastAPI) + PostgreSQL 实现的借展交接核验服务。调用方提交展品编号及按时间排列的交接记录（地点、交出人、接收人、封签号、时间、凭证摘要），服务完成规则核验、幂等写入与哈希链审计；已入链交接记录的凭证摘要录错时，馆方可提交**补正单**更正——原交接记录与其 `record_hash` 永不改写，补正按展品独立成链并锚定原记录。馆方还可对**最新且已受理、未被补正引用的交接批次**提交**撤回**——撤回同样只追加不可变撤回记录（展品独立撤回哈希链），原交接记录与原链历史长度不变，展品当前保管人、封签与有效交接列表按撤回后状态计算。
+Python (FastAPI) + PostgreSQL 实现的借展交接核验服务。调用方提交展品编号及按时间排列的交接记录（地点、交出人、接收人、封签号、时间、凭证摘要），服务完成规则核验、幂等写入与哈希链审计；已入链交接记录的凭证摘要录错时，馆方可提交**补正单**更正——原交接记录与其 `record_hash` 永不改写，补正按展品独立成链并锚定原记录。馆方还可对**最新且已受理、未被补正引用的交接批次**提交**撤回**——撤回同样只追加不可变撤回记录（展品独立撤回哈希链），原交接记录与原链历史长度不变，展品当前保管人、封签与有效交接列表按撤回后状态计算。借展车次同时交接多件展品时，馆方可提交**车次整车交接单**——同一车次下 2 至 20 件互不重复的展品一次确认整车结果：逐件沿用同一套规则、以撤回后的有效状态核验，全数通过才在同一事务中为各件写入既有批次与原交接哈希链；任一件失败仅落整单拒绝报告，不写批次和记录、不推进任何展品状态。
 
 ## 功能特性
 
@@ -12,6 +12,7 @@ Python (FastAPI) + PostgreSQL 实现的借展交接核验服务。调用方提�
 - **可查询审计链**：每条交接记录携带 `prev_hash` / `record_hash` 构成哈希链，提供链查询与完整性复算接口
 - **凭证摘要补正**：对已入链记录提交补正单（展品编号、链序号、预期当前有效摘要、新摘要、补正原因、幂等键）；原记录与 `record_hash` 不改写，补正按展品另成一条哈希链、每环锚定被补正原记录；交接查询同时呈现**原摘要 / 当前有效摘要 / 补正轨迹**，审计同时复算两条链并定位首个失效环
 - **已受理批次撤回**：对展品**最新且 ACCEPTED、未被补正引用**的交接批次提交撤回（展品编号、批次号、撤回原因、幂等键）；存在更晚已受理批次、目标不存在、批次被驳回或原因为空时拒绝。撤回**不删除、不改写**原交接记录与哈希，只追加不可变撤回记录（展品独立撤回哈希链，锚定被撤回批次全部记录的 `record_hash`）；**原链历史长度保持不变**，展品当前保管人/封签/最近时间与有效交接列表按撤回后状态重算，审计同时复算**交接链、补正链、撤回链**三条链
+- **车次整车交接**：同一车次下 2 至 20 件互不重复展品一次确认整车结果（车次号、各件展品编号及各自时序交接记录、幂等键）；逐件沿用现有规则、以撤回后的有效状态核验。全数通过时在同一事务中为各件写入既有批次与原交接哈希链，返回车次号及各批次报告；任一件失败仅落整单拒绝报告（列出各件逐条结果），不写交接批次和记录、不推进任何展品状态；展品不存在或请求格式不合法时整单报错且不写入。并发重叠车次或单件提交不会导致部分入链
 - **逐项诊断**：输出核验状态、首个断点（first_break）及每条记录的全部不合格原因
 
 ## 快速开始
@@ -26,7 +27,7 @@ docker compose up --build
 - PostgreSQL: localhost:5432 （用户/密码 `app`/`app`，库 `seals`）
 - `db/init.sql` 在数据库首次启动时自动执行，建表并写入两件种子展品（`EX-0001`、`EX-0002`）
 
-一键跑通完整演示（登记展品 → 预演取令牌 → 凭令牌提交 → 幂等重试 → 令牌失效/非法 → 409 冲突 → 违规批次 → 链查询 → 审计校验 → 凭证摘要补正与双链审计 → 已受理批次撤回与三链审计）：
+一键跑通完整演示（登记展品 → 预演取令牌 → 凭令牌提交 → 幂等重试 → 令牌失效/非法 → 409 冲突 → 违规批次 → 链查询 → 审计校验 → 凭证摘要补正与双链审计 → 已受理批次撤回与三链审计 → 车次整车交接整单确认/拒绝/幂等与单件共存）：
 
 ```bash
 ./examples/demo.sh
@@ -66,6 +67,8 @@ docker compose up --build
 | POST | `/api/v1/handover-batches/rehearse` | **预演交接批次（只读）**：同载荷规则核验，返回逐条结果、首个断点与状态令牌，不写任何数据 |
 | POST | `/api/v1/handover-batches` | **提交交接批次并核验**（需 `Idempotency-Key` 头，可选 `Handover-Token` 头） |
 | GET | `/api/v1/handover-batches/{batch_id}` | 查询批次核验报告 |
+| POST | `/api/v1/vehicle-handovers` | **车次整车交接**：同一车次 2 至 20 件展品一次确认整单结果（需 `Idempotency-Key` 头） |
+| GET | `/api/v1/vehicle-handovers/{vehicle_order_id}` | 查询车次整车交接整单报告（含各件逐条结果/批次报告） |
 | GET | `/api/v1/exhibits/{id}/handovers` | 查询完整交接链（含哈希；每环附当前有效摘要与补正轨迹） |
 | GET | `/api/v1/exhibits/{id}/handovers/{seq}` | 查询单个交接环节（原摘要、当前有效摘要、补正轨迹） |
 | POST | `/api/v1/exhibits/{id}/handovers/{seq}/digest-corrections` | **提交凭证摘要补正单**（需 `Idempotency-Key` 头） |
@@ -325,6 +328,73 @@ curl http://localhost:8000/api/v1/exhibits/EX-0001/batches
 
 **审计**：`audit/verify` 同时复算三条链——交接链（原链历史，含已撤回记录）、补正链、撤回链。撤回链逐环重算 `record_hash = sha256(prev_hash ‖ 撤回业务字段 ‖ 被撤回批次全部原记录 record_hash 锚点 ‖ created_at)`，并校验：被撤回批次存在、属于该展品且为 `ACCEPTED`；锚点列表与该批次现存记录的存储哈希及诚实重算哈希逐条一致（原记录被删除/改写即在首个引用环报「锚定失效」）；链尾与展品撤回状态一致；按撤回链重放的有效保管人/封签/最近时间与展品当前列一致。
 
+### 9. 车次整车交接（同一车次多件展品一次确认）
+
+借展车次同时交接多件展品时，馆方提交**整车交接单**：同一车次号下 **2 至 20 件互不重复**的展品编号及各自按时序排列的交接记录，并携带 `Idempotency-Key` 请求头。逐件沿用单件接口的同一套规则、以**撤回后的有效状态**核验；馆方一次确认整车结果：
+
+- **全数通过**：在**同一事务**中为各件写入既有批次（`batches`）与原交接哈希链（`handover_records`，各件记录仍线性追加在各自展品物理链尾）并推进各展品状态；返回车次号及各批次报告，各件批次可经 `GET /api/v1/handover-batches/{batch_id}` 等既有接口查询。
+- **任一件核验失败**：保存整单 `REJECTED` 报告（列出各件逐条结果，合格件也给出逐条通过结果但 `batch_id` 为 `null`），**不写交接批次和记录、不推进任何展品状态**。
+- **展品不存在 / 请求格式不合法**（件数越界、展品重复、记录格式非法）：整单报错（`404` / `422`），**不写入任何数据**（整单报告也不留痕）。
+- **并发**：重叠车次或单件提交在同一组展品行锁下串行，**不会导致部分入链**。
+
+```bash
+curl -X POST http://localhost:8000/api/v1/vehicle-handovers \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: veh-2026-1001' \
+  -d @examples/vehicle.json
+```
+
+受理响应（`status=ACCEPTED`，`items` 为各件批次报告）：
+
+```json
+{
+  "vehicle_order_id": "…", "vehicle_id": "TRAIN-2026-1001",
+  "status": "ACCEPTED", "item_count": 2,
+  "items": [
+    {"exhibit_id": "EX-0001", "batch_id": "…", "status": "ACCEPTED", "record_count": 1,
+     "first_break": null, "items": [{"seq": 1, "ok": true, "reasons": []}]},
+    {"exhibit_id": "EX-0002", "batch_id": "…", "status": "ACCEPTED", "record_count": 1,
+     "first_break": null, "items": [{"seq": 1, "ok": true, "reasons": []}]}
+  ],
+  "idempotent_replay": false, "created_at": "2026-10-06T08:00:00.000000Z"
+}
+```
+
+拒绝响应（`status=REJECTED`；示例见 `examples/vehicle-reject.json`——第二件首站地点/交出人与登记不符、无授权换签且凭证非法，整单拒绝，两件展品链状态均不推进）：
+
+```json
+{
+  "vehicle_order_id": "…", "vehicle_id": "TRAIN-2026-1002",
+  "status": "REJECTED", "item_count": 2,
+  "items": [
+    {"exhibit_id": "EX-0001", "batch_id": null, "status": "ACCEPTED", "record_count": 1,
+     "first_break": null, "items": [{"seq": 1, "ok": true, "reasons": []}]},
+    {"exhibit_id": "EX-0002", "batch_id": null, "status": "REJECTED", "record_count": 1,
+     "first_break": {"seq": 1, "rule": "FIRST_STATION_LOCATION", "message": "首站地点「上海博物馆交接区」与登记馆藏地「国家博物馆一层库房」不一致"},
+     "items": [{"seq": 1, "ok": false, "reasons": [
+       {"rule": "FIRST_STATION_LOCATION", "message": "首站地点「上海博物馆交接区」与登记馆藏地「国家博物馆一层库房」不一致"},
+       {"rule": "FIRST_STATION_CUSTODIAN", "message": "首站交出人「孙倩」与登记保管人「王芳」不一致"},
+       {"rule": "SEAL_CHANGED_WITHOUT_AUTH", "message": "封签号由「SEAL-BJ-0002」变更为「SEAL-XA-2001」，但未提供换签授权理由"},
+       {"rule": "INVALID_VOUCHER_DIGEST", "message": "凭证摘要格式非法，应为「算法:十六进制摘要」，如 sha256:<64位hex>"}
+     ]}]}
+  ],
+  "idempotent_replay": false, "created_at": "2026-10-06T08:05:00.000000Z"
+}
+```
+
+受理与拒绝规则：
+
+| 情形 | 结果 |
+|---|---|
+| 全部展品存在且逐件核验通过 | `200` + `status=ACCEPTED`，同一事务各件入链 |
+| 任一件核验失败 | `200` + `status=REJECTED`，仅落整单拒绝报告 |
+| 任一展品不存在 | `404`，整单不写入 |
+| 件数 <2 或 >20、展品编号重复、记录格式非法 | `422`，整单不写入 |
+| 同键同载荷重试（含拒绝结果） | 原整单报告，`idempotent_replay=true` |
+| 同键不同载荷 | `409` |
+
+**查询**：`GET /api/v1/vehicle-handovers/{vehicle_order_id}` 按整单号查询整单报告；各件批次报告、交接链、补正、撤回与三链审计均沿用既有单件接口，行为完全兼容。
+
 ## 设计说明
 
 - **预演**：`POST /rehearse` 仅做一次普通 `SELECT` 读取展品当前状态，复用同一套 `validate_batch` 规则引擎；不落批次报告、不落交接记录、不推进展品状态，可安全重复调用。
@@ -335,7 +405,8 @@ curl http://localhost:8000/api/v1/exhibits/EX-0001/batches
 - **交接哈希链**：首环 `prev_hash = GENESIS`，之后每环指向前环 `record_hash`；时间统一规范化为 UTC 微秒精度 `Z` 格式后参与哈希，保证写入与复算一致。撤回不删除、不改写任何一环：撤回后新受理批次的记录仍线性追加在物理链尾（`prev_hash` 接物理上一环，可能是已撤回记录），因此原链始终是连续完整的追加式哈希链；哪些环节「当前有效」由旁路撤回链在查询/核验时计算。
 - **补正哈希链**：按展品独立成链，首环 `prev_hash = CORRECTIONS_GENESIS`；每环 `record_hash = sha256(prev_hash ‖ 补正业务字段 ‖ 被补正原记录 record_hash 锚点 ‖ created_at)`。补正不触碰 `handover_records`，原记录与原交接链恒不变。审计时对每条交接记录按其存储 `prev_hash` **独立**重算「诚实」`record_hash`（全量，不在断裂处中断）：补正环锚点须同时等于存储的原 `record_hash` 与重算出的诚实哈希——原记录内容被改写（即便连带伪造存储哈希列）也会在首个引用它的补正环报「锚定失效」。
 - **撤回哈希链**：按展品独立成链，首环 `prev_hash = WITHDRAWALS_GENESIS`；每环 `record_hash = sha256(prev_hash ‖ 撤回业务字段（withdrawal_id/batch_id/reason/seq/created_at）‖ 被撤回批次全部交接记录 record_hash 锚点列表)`。撤回不触碰 `handover_records`/`batches` 与原链头；审计时撤回环锚点列表须逐序等于该批次记录的存储哈希与诚实哈希——被撤回批次记录被删除、改写或乱序即在首个引用它的撤回环报「锚定失效」。审计还按撤回链重放有效链，校验展品当前 custodian/current_seal/last_time 与重放结果一致。有效状态为空（全部撤回）时回退到登记保管人/初始封签（旧卷迁移数据以首环交出人/封签兜底）。
-- **升级兼容**：`db/init.sql` 为全新库的完整结构；对已有数据卷，应用启动时 `app/migrations.py:ensure_schema()` 以 `ADD COLUMN IF NOT EXISTS` / `CREATE TABLE IF NOT EXISTS` 幂等补齐补正列与 `digest_corrections` 表、撤回列（`withdrawal_chain_length`/`withdrawal_head_hash`/`registered_custodian`/`registered_initial_seal`）与 `batch_withdrawals` 表，并对旧数据幂等回填登记保管人/初始封签，旧卷平滑升级、可重复执行。
+- **车次整车交接**：`vehicle_handovers` 表保存整单报告（`idempotency_key` 全局唯一 + `request_hash` 指纹，幂等语义与单件接口一致，拒绝结果同样可重放）。处理时按展品编号排序对全部涉及展品行 `SELECT ... FOR UPDATE`（确定性加锁顺序避免重叠车次死锁），与单件提交、补正、撤回在同一锁层级互斥；逐件以撤回后有效状态核验。全数通过时各件批次行（派生幂等键 `{整车键}#veh#{展品编号}`）、交接记录与展品状态推进都在同一事务提交；任一件失败仅落整单 REJECTED 报告行，`batches`/`handover_records`/`exhibits` 零变更；`404/422` 在整单报告写入前中止，不留痕。整车入链的批次与记录就是普通批次与记录：单件查询、补正、撤回、批次历史与三链审计无需任何特判。
+- **升级兼容**：`db/init.sql` 为全新库的完整结构；对已有数据卷，应用启动时 `app/migrations.py:ensure_schema()` 以 `ADD COLUMN IF NOT EXISTS` / `CREATE TABLE IF NOT EXISTS` 幂等补齐补正列与 `digest_corrections` 表、撤回列（`withdrawal_chain_length`/`withdrawal_head_hash`/`registered_custodian`/`registered_initial_seal`）与 `batch_withdrawals` 表、`vehicle_handovers` 表，并对旧数据幂等回填登记保管人/初始封签，旧卷平滑升级、可重复执行。
 
 ## 本地开发与测试
 
@@ -346,27 +417,28 @@ pytest tests/                 # 规则引擎、令牌、补正/撤回哈希单�
 uvicorn app.main:app --reload # 需本地 PostgreSQL 并执行 db/init.sql（旧库启动时自动迁移）
 ```
 
-`tests/test_api_rehearsal.py`（预演/令牌）、`tests/test_api_corrections.py`（凭证摘要补正）
-与 `tests/test_api_withdrawals.py`（已受理批次撤回）为端到端测试，需可达的 PostgreSQL，
+`tests/test_api_rehearsal.py`（预演/令牌）、`tests/test_api_corrections.py`（凭证摘要补正）、
+`tests/test_api_withdrawals.py`（已受理批次撤回）与 `tests/test_api_vehicle_handovers.py`
+（车次整车交接）为端到端测试，需可达的 PostgreSQL，
 通过 `DATABASE_URL` 指定；数据库不可达时自动跳过：
 
 ```bash
-DATABASE_URL='postgresql://app:app@localhost:5432/seals' pytest tests/test_api_rehearsal.py tests/test_api_corrections.py tests/test_api_withdrawals.py
+DATABASE_URL='postgresql://app:app@localhost:5432/seals' pytest tests/test_api_rehearsal.py tests/test_api_corrections.py tests/test_api_withdrawals.py tests/test_api_vehicle_handovers.py
 ```
 
 ## 目录结构
 
 ```
 app/
-  main.py        # FastAPI 路由与事务编排（/rehearse、令牌、补正单、批次撤回与三链审计）
+  main.py        # FastAPI 路由与事务编排（/rehearse、令牌、补正单、批次撤回、车次整车交接与三链审计）
   validation.py  # 规则引擎（纯标准库，可独立单测）
   tokens.py      # 展品状态令牌：签发/验签/链快照比对（纯标准库，可独立单测）
   hashing.py     # 规范化序列化、请求指纹、交接/补正/撤回哈希链
-  migrations.py  # 启动时幂等迁移：旧卷补齐补正/撤回列与 digest_corrections/batch_withdrawals 表
+  migrations.py  # 启动时幂等迁移：旧卷补齐补正/撤回列与 digest_corrections/batch_withdrawals/vehicle_handovers 表
   schemas.py     # 请求/响应模型
   db.py          # 连接与启动等待
 db/init.sql      # 建表 + 种子展品（Compose 首启自动执行）
-examples/        # accept/reject/correction/withdrawal 示例载荷与端到端 demo.sh（含补正与撤回流程）
-tests/           # 规则引擎、令牌、补正/撤回哈希单测与预演/补正/撤回端到端测试
+examples/        # accept/reject/correction/withdrawal/vehicle 示例载荷与端到端 demo.sh（含补正、撤回与整车交接流程）
+tests/           # 规则引擎、令牌、补正/撤回/整车哈希单测与预演/补正/撤回/整车交接端到端测试
 Dockerfile  docker-compose.yml  requirements*.txt
 ```
